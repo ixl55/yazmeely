@@ -1,3 +1,7 @@
-yt-dlp==2026.03.13
-python-telegram-bot==20.7
-Flask==3.1.1
+# حدّث yt-dlp باستمرار: pip install -U "yt-dlp[default]"  (يوتيوب يتغير كل أسبوع تقريباً)
+yt-dlp[default]>=2026.8.19
+# إضافة PO Token — تساعد كثيراً ضد حظر يوتيوب على السيرفرات (تحتاج POT_PROVIDER_URL)
+bgutil-ytdlp-pot-provider>=2.0
+python-telegram-bot>=22.0,<23
+Flask>=3.1
+python-dotenv>=1.0

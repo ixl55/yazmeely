@@ -1,1024 +1,913 @@
-import os
+"""
+بوت تيليجرام لتحميل الفيديو والصوت من YouTube و TikTok و Instagram و X و Facebook.
+
+كل الإعدادات تُقرأ من متغيرات البيئة (أو من ملف .env) — راجع .env.example و README.md.
+"""
+
+import asyncio
+import functools
+import html
 import json
 import logging
-import subprocess
-import sys
-import asyncio
-import tempfile
+import math
+import os
+import re
 import shutil
-from yt_dlp import YoutubeDL
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    ContextTypes,
-    filters
-)
-from telegram.constants import ParseMode
-from flask import Flask
+import tempfile
+import uuid
+from datetime import datetime, timezone
 from threading import Thread
 
-# إعداد التسجيل
+from dotenv import load_dotenv
+from flask import Flask
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+    Update,
+)
+from telegram.constants import ChatAction, ParseMode
+from telegram.error import BadRequest, Forbidden, RetryAfter
+from telegram.ext import (
+    ApplicationBuilder,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
+from yt_dlp import YoutubeDL
+from yt_dlp.utils import DownloadError
+
+load_dotenv()
+
+# ================================
+# الإعدادات
+# ================================
+
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    level=logging.INFO,
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("yazmeely")
 logging.getLogger('werkzeug').setLevel(logging.ERROR)
+logging.getLogger('httpx').setLevel(logging.WARNING)
 
-# إعداد Flask
-flask_app = Flask('')
+
+def _env_list(name: str) -> list[str]:
+    return [x.strip() for x in os.getenv(name, '').split(',') if x.strip()]
+
+
+BOT_TOKEN = os.getenv('BOT_TOKEN', '').strip()
+ADMIN_IDS = {int(x) for x in _env_list('ADMIN_IDS')}
+REQUIRED_CHANNEL = os.getenv('REQUIRED_CHANNEL', '').strip()  # مثال: @mychannel — اتركه فارغاً لتعطيل الاشتراك الإجباري
+
+DATA_DIR = os.getenv('DATA_DIR', 'data')
+DOWNLOAD_DIR = os.path.join(DATA_DIR, 'downloads')
+USERS_FILE = os.path.join(DATA_DIR, 'users.json')
+COOKIES_FILE = os.path.join(DATA_DIR, 'cookies.txt')
+COOKIES_CONFIG_FILE = os.path.join(DATA_DIR, 'cookies_config.json')
+
+MAX_DURATION_SECONDS = int(os.getenv('MAX_DURATION_MINUTES', '90')) * 60
+# حد Bot API الرسمي للرفع هو 50MB. مع Local Bot API Server يمكن رفعه حتى 2000MB.
+MAX_FILE_SIZE_MB = int(os.getenv('MAX_FILE_SIZE_MB', '50'))
+MAX_FILE_SIZE = MAX_FILE_SIZE_MB * 1024 * 1024
+MAX_CONCURRENT_DOWNLOADS = int(os.getenv('MAX_CONCURRENT_DOWNLOADS', '2'))
+VIDEO_MAX_HEIGHT = int(os.getenv('VIDEO_MAX_HEIGHT', '720'))
+
+# حلول حظر يوتيوب للسيرفرات (راجع README)
+PROXY = os.getenv('PROXY', '').strip()                       # http://user:pass@host:port أو socks5://host:port
+POT_PROVIDER_URL = os.getenv('POT_PROVIDER_URL', '').strip()  # http://bgutil-provider:4416
+YT_PLAYER_CLIENTS = _env_list('YT_PLAYER_CLIENTS')          # مثال: default,tv,web_safari
+
+TELEGRAM_API_URL = os.getenv('TELEGRAM_API_URL', '').strip().rstrip('/')  # Local Bot API Server (اختياري)
+PORT = int(os.getenv('PORT', '8080'))
+WEB_SERVER = os.getenv('WEB_SERVER', '1') != '0'
+
+URL_RE = re.compile(r'https?://\S+')
+SUPPORTED_SITES = (
+    'youtube.com', 'youtu.be', 'tiktok.com', 'instagram.com',
+    'twitter.com', 'x.com', 'facebook.com', 'fb.watch',
+)
+
+FFMPEG_PATH = shutil.which('ffmpeg')
+download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
+
+
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
+
+# ================================
+# خادم الويب (للاستضافات التي تتطلب منفذ HTTP مفتوح)
+# ================================
+
+flask_app = Flask(__name__)
+
+
 @flask_app.route('/')
 def home():
     return "✅ البوت يعمل"
+
+
 def run_flask():
-    flask_app.run(host='0.0.0.0', port=8080)
-Thread(target=run_flask, daemon=True).start()
+    flask_app.run(host='0.0.0.0', port=PORT)
 
-# إعدادات البوت
-BOT_TOKEN = '7678984064:AAEjgukqYQVYyTWS54xEg8wL_rIl_0CAKBw'
-ADMIN_IDS = [1481056671]
-REQUIRED_CHANNEL = "@ctf5bro"
-COOKIES_FILE = 'cookies.txt'
 
-DOWNLOAD_DIR = 'downloads'
-USERS_FILE = 'users.json'
-COOKIES_CONFIG_FILE = 'cookies_config.json'
-os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+# ================================
+# التخزين (المستخدمون والإعدادات)
+# ================================
 
-MAX_DURATION_SECONDS = 400 * 60
-MAX_FILE_SIZE = 75 * 1024 * 1024
+def _atomic_write_json(path: str, data) -> None:
+    tmp = f"{path}.tmp"
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, path)
 
-SUPPORTED_SITES = [
-    "youtube.com", "youtu.be", "tiktok.com", "instagram.com",
-    "twitter.com", "facebook.com", "fb.watch"
-]
 
-# البحث عن ffmpeg
-def find_ffmpeg():
-    path = shutil.which('ffmpeg')
-    if path:
-        logger.info(f"✅ تم العثور على ffmpeg في: {path}")
-        return path
-        
-    possible_paths = ['ffmpeg', '/usr/bin/ffmpeg', '/usr/local/bin/ffmpeg']
-    for path in possible_paths:
-        try:
-            result = subprocess.run([path, '-version'], capture_output=True, text=True, timeout=5)
-            if result.returncode == 0:
-                logger.info(f"✅ تم العثور على ffmpeg في: {path}")
-                return path
-        except:
-            continue
-    logger.error("❌ لم يتم العثور على ffmpeg")
+def _read_json(path: str, default):
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return default
+    except Exception as e:
+        logger.error(f"خطأ في قراءة {path}: {e}")
+        return default
+
+
+class UserStore:
+    """تخزين المستخدمين في الذاكرة مع حفظ آمن على القرص."""
+
+    def __init__(self, path: str):
+        self.path = path
+        self.users: dict[str, dict] = {}
+        self.lock = asyncio.Lock()
+
+    def load(self) -> None:
+        data = _read_json(self.path, {})
+        for uid, value in list(data.items()):
+            # تحويل الصيغة القديمة {id: username}
+            if isinstance(value, str):
+                data[uid] = {"username": value, "banned": False, "date_joined": None}
+        self.users = data
+
+    async def save(self) -> None:
+        snapshot = json.loads(json.dumps(self.users))
+        await asyncio.to_thread(_atomic_write_json, self.path, snapshot)
+
+    async def touch(self, user) -> dict:
+        """تسجيل المستخدم أو تحديث اسمه، وإرجاع بياناته."""
+        uid = str(user.id)
+        username = user.username or user.full_name or "بدون اسم"
+        async with self.lock:
+            record = self.users.get(uid)
+            if record is None:
+                record = {
+                    "username": username,
+                    "banned": False,
+                    "date_joined": datetime.now(timezone.utc).isoformat(timespec='seconds'),
+                }
+                self.users[uid] = record
+                logger.info(f"✅ مستخدم جديد: {uid} - {username}")
+                await self.save()
+            elif record.get('username') != username:
+                record['username'] = username
+                await self.save()
+            return record
+
+    def is_banned(self, user_id: int) -> bool:
+        return self.users.get(str(user_id), {}).get('banned', False)
+
+    async def set_banned(self, uid: str, banned: bool) -> bool:
+        async with self.lock:
+            if uid not in self.users:
+                return False
+            self.users[uid]['banned'] = banned
+            await self.save()
+            return True
+
+
+store = UserStore(USERS_FILE)
+
+
+def load_cookies_config() -> dict:
+    return _read_json(COOKIES_CONFIG_FILE, {"enabled": False})
+
+
+def save_cookies_config(config: dict) -> None:
+    _atomic_write_json(COOKIES_CONFIG_FILE, config)
+
+
+def get_active_cookies_path() -> str | None:
+    if not load_cookies_config().get("enabled", False):
+        return None
+    if os.path.exists(COOKIES_FILE) and os.path.getsize(COOKIES_FILE) > 100:
+        return COOKIES_FILE
+    logger.warning("⚠️ الكوكيز مفعلة لكن الملف غير موجود أو فارغ")
     return None
 
-FFMPEG_PATH = find_ffmpeg()
-if FFMPEG_PATH:
-    os.environ['FFMPEG_BINARY'] = FFMPEG_PATH
 
 # ================================
-# نظام إدارة الكوكيز المحسن
+# yt-dlp
 # ================================
 
-def load_cookies_config():
-    """تحميل إعدادات الكوكيز"""
-    default_config = {
-        "cookies_file": COOKIES_FILE,
-        "enabled": False,
-        "method": "manual"
+def base_ydl_opts() -> dict:
+    opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'noplaylist': True,
+        'retries': 3,
+        'fragment_retries': 3,
+        'socket_timeout': 30,
+        'concurrent_fragment_downloads': 4,
+        # تمهّل بين الطلبات لتقليل احتمال الحظر
+        'sleep_interval_requests': 1,
     }
-    try:
-        if os.path.exists(COOKIES_CONFIG_FILE):
-            with open(COOKIES_CONFIG_FILE, 'r', encoding='utf-8') as f:
-                return json.load(f)
-    except Exception as e:
-        logger.error(f"خطأ في تحميل إعدادات الكوكيز: {e}")
-    return default_config
+    if FFMPEG_PATH:
+        opts['ffmpeg_location'] = os.path.dirname(FFMPEG_PATH)
+    if PROXY:
+        opts['proxy'] = PROXY
 
-def save_cookies_config(config):
-    """حفظ إعدادات الكوكيز"""
-    try:
-        with open(COOKIES_CONFIG_FILE, 'w', encoding='utf-8') as f:
-            json.dump(config, f, indent=2, ensure_ascii=False)
-    except Exception as e:
-        logger.error(f"خطأ في حفظ إعدادات الكوكيز: {e}")
+    youtube_args = {}
+    if YT_PLAYER_CLIENTS:
+        youtube_args['player_client'] = YT_PLAYER_CLIENTS
+    extractor_args = {}
+    if youtube_args:
+        extractor_args['youtube'] = youtube_args
+    if POT_PROVIDER_URL:
+        # يتطلب تثبيت الإضافة bgutil-ytdlp-pot-provider (موجودة في requirements.txt)
+        extractor_args['youtubepot-bgutilhttp'] = {'base_url': [POT_PROVIDER_URL]}
+    if extractor_args:
+        opts['extractor_args'] = extractor_args
+    return opts
 
-def get_active_cookies_path():
-    """الحصول على مسار الكوكيز إذا كانت مفعلة"""
-    config = load_cookies_config()
-    
-    if not config.get("enabled", False):
-        return None
-    
-    cookies_path = config.get("cookies_file", COOKIES_FILE)
-    
-    if os.path.exists(cookies_path) and os.path.getsize(cookies_path) > 100:
-        logger.info(f"✅ استخدام ملف الكوكيز: {cookies_path}")
-        return cookies_path
-    else:
-        logger.warning(f"⚠️ ملف الكوكيز غير صالح: {cookies_path}")
-        return None
 
-def validate_cookies_file(file_path):
-    """التحقق من صحة ملف الكوكيز بربطه بـ YouTube"""
+def validate_cookies_file(file_path: str) -> tuple[bool, str]:
+    """فحص صيغة ملف الكوكيز (Netscape) ثم تجربته فعلياً على يوتيوب."""
     try:
-        if not os.path.exists(file_path):
-            return False, "الملف غير موجود"
-        
-        if os.path.getsize(file_path) < 100:
-            return False, "الملف صغير جداً"
-        
-        # اختبار بسيط لاستخراج المعلومات فقط لتجنب أخطاء الفورمات
-        ydl_opts = {
-            'cookiefile': file_path,
-            'quiet': True,
-            'skip_download': True,
-            'extract_flat': True,
-            'format': 'best' # استخدام أبسط فورمات للاختبار
-        }
-        
-        with YoutubeDL(ydl_opts) as ydl:
-            # استخدام فيديو مشهور ومستقر للاختبار
-            ydl.extract_info('https://www.youtube.com/watch?v=BaW_jenozKc', download=False)
-        
+        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            lines = [ln for ln in f if ln.strip() and not ln.startswith('#')]
+    except OSError:
+        return False, "الملف غير موجود"
+
+    rows = [ln.split('\t') for ln in lines]
+    if not rows or any(len(r) < 7 for r in rows[:20]):
+        return False, "الملف ليس بصيغة Netscape (cookies.txt)"
+    if not any('youtube.com' in r[0] for r in rows):
+        return False, "الملف لا يحتوي كوكيز youtube.com"
+
+    opts = base_ydl_opts()
+    opts.update({'cookiefile': file_path, 'skip_download': True})
+    try:
+        with YoutubeDL(opts) as ydl:
+            ydl.extract_info('https://www.youtube.com/watch?v=jNQXAC9IVRw', download=False, process=False)
         return True, "✅ الكوكيز صالحة"
-        
     except Exception as e:
-        error_msg = str(e)
-        # إذا كان الخطأ متعلق بالفورمات وليس بصحة الكوكيز، نعتبرها صالحة
-        if "format is not available" in error_msg:
-             return True, "✅ الكوكيز صالحة (تم تخطي خطأ الفورمات)"
-        return False, f"❌ الكوكيز غير صالحة: {error_msg}"
+        msg = str(e)
+        if 'Sign in to confirm' in msg:
+            return False, "يوتيوب ما زال يطلب التحقق (الكوكيز منتهية أو الـ IP محظور)"
+        return False, f"فشل الاختبار: {msg[:200]}"
 
-# ================================
-# أوامر إدارة الكوكيز
-# ================================
 
-async def cookies_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """إدارة إعدادات الكوكيز"""
-    user_id = update.effective_user.id
-    if user_id not in ADMIN_IDS:
-        await update.message.reply_text("🚫 هذه الميزة مخصصة للمسؤول فقط.")
-        return
+class DownloadFailed(Exception):
+    pass
 
-    config = load_cookies_config()
-    cookies_status = "✅ مفعل" if config.get("enabled", False) else "❌ غير مفعل"
-    
-    cookies_path = config.get("cookies_file", COOKIES_FILE)
-    is_valid, validation_msg = validate_cookies_file(cookies_path) if config.get("enabled", False) else (False, "غير مفعل")
-    
-    message = (
-        f"🍪 **إعدادات الكوكيز:**\n\n"
-        f"• الحالة: {cookies_status}\n"
-        f"• الملف: {cookies_path}\n"
-        f"• الصلاحية: {validation_msg}\n\n"
-        f"**الأوامر المتاحة:**\n"
-        f"/cookies_on - تفعيل الكوكيز\n"
-        f"/cookies_off - إيقاف الكوكيز\n"
-        f"/cookies_upload - رفع ملف كوكيز جديد\n"
-        f"/cookies_status - عرض الحالة الحالية\n"
-    )
-    
-    await update.message.reply_text(message)
 
-async def cookies_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """تفعيل استخدام الكوكيز"""
-    user_id = update.effective_user.id
-    if user_id not in ADMIN_IDS:
-        await update.message.reply_text("🚫 هذه الميزة مخصصة للمسؤول فقط.")
-        return
+def friendly_error(err: str) -> str:
+    if 'Sign in to confirm' in err or 'not a bot' in err:
+        return ("🤖 يوتيوب حظر السيرفر مؤقتاً (يطلب التحقق من أنك لست روبوت).\n"
+                "تم إبلاغ الإدارة، حاول لاحقاً.")
+    if 'Private video' in err or 'login required' in err.lower() or 'Sign in' in err:
+        return "🔒 الفيديو خاص أو يتطلب تسجيل الدخول."
+    if 'Video unavailable' in err or 'is not available' in err:
+        return "❌ الفيديو غير متاح (محذوف أو محجوب في منطقة السيرفر)."
+    if 'File is larger than max-filesize' in err or 'too large' in err:
+        return f"📦 حجم الملف أكبر من {MAX_FILE_SIZE_MB}MB."
+    if 'duration' in err.lower() and 'long' in err.lower():
+        return f"⏱️ الفيديو أطول من {MAX_DURATION_SECONDS // 60} دقيقة."
+    if 'Requested format' in err:
+        return "❌ لا توجد صيغة مناسبة لهذا الفيديو."
+    if 'Unsupported URL' in err:
+        return "⚠️ الرابط غير مدعوم."
+    return "❌ تعذر التحميل. تأكد من الرابط وحاول مرة أخرى."
 
-    config = load_cookies_config()
-    config["enabled"] = True
-    save_cookies_config(config)
-    
-    cookies_path = config.get("cookies_file", COOKIES_FILE)
-    is_valid, validation_msg = validate_cookies_file(cookies_path)
-    
-    if is_valid:
-        await update.message.reply_text(f"✅ تم تفعيل الكوكيز\n{validation_msg}")
-    else:
-        await update.message.reply_text(f"⚠️ تم تفعيل الكوكيز ولكن: {validation_msg}")
 
-async def cookies_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """إيقاف استخدام الكوكيز"""
-    user_id = update.effective_user.id
-    if user_id not in ADMIN_IDS:
-        await update.message.reply_text("🚫 هذه الميزة مخصصة للمسؤول فقط.")
-        return
-
-    config = load_cookies_config()
-    config["enabled"] = False
-    save_cookies_config(config)
-    
-    await update.message.reply_text("✅ تم إيقاف الكوكيز")
-
-async def cookies_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """طلب رفع ملف الكوكيز"""
-    user_id = update.effective_user.id
-    if user_id not in ADMIN_IDS:
-        await update.message.reply_text("🚫 هذه الميزة مخصصة للمسؤول فقط.")
-        return
-
-    message = (
-        "📤 **رفع ملف الكوكيز:**\n\n"
-        "1. أنشئ ملف `cookies.txt` من متصفحك الشخصي\n"
-        "2. أرسل الملف كـ **ملف نصي** إلى هذا البوت\n"
-        "3. سيتم التحقق من صحته تلقائياً\n\n"
-        "🛠 **كيف تنشئ الملف:**\n"
-        "• استخدم إضافة 'Get cookies.txt LOCALLY' لمتصفح Chrome\n"
-        "• أو انسخ الكوكيز يدوياً من Developer Tools\n\n"
-        "⏳ بانتظار رفع الملف..."
-    )
-    
-    await update.message.reply_text(message)
-    
-    # حفظ حالة المستخدم لمعالجة الملف
-    if 'user_states' not in context.chat_data:
-        context.chat_data['user_states'] = {}
-    context.chat_data['user_states'][user_id] = 'awaiting_cookies_file'
-
-async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """معالجة الملفات المرسلة"""
-    user_id = update.effective_user.id
-    if user_id not in ADMIN_IDS:
-        return
-
-    # التحقق إذا كان المستخدم ينتظر ملف كوكيز
-    user_states = context.chat_data.get('user_states', {})
-    if user_states.get(user_id) != 'awaiting_cookies_file':
-        return
-
-    document = update.message.document
-    
-    # التحقق من نوع الملف
-    if document.mime_type != 'text/plain' and not document.file_name.endswith('.txt'):
-        await update.message.reply_text("❌ يرجى رفع ملف نصي (txt) فقط")
-        return
-
-    try:
-        # تحميل الملف
-        file = await context.bot.get_file(document.file_id)
-        
-        # حفظ الملف مؤقتاً
-        temp_file = f"temp_cookies_{user_id}.txt"
-        await file.download_to_drive(temp_file)
-        
-        # التحقق من صحة الملف
-        is_valid, validation_msg = validate_cookies_file(temp_file)
-        
-        if is_valid:
-            # نسخ الملف إلى المكان الرئيسي
-            import shutil
-            shutil.copy(temp_file, COOKIES_FILE)
-            
-            # تفعيل الكوكيز تلقائياً
-            config = load_cookies_config()
-            config["enabled"] = True
-            config["cookies_file"] = COOKIES_FILE
-            save_cookies_config(config)
-            
-            # تنظيف الملف المؤقت
-            os.remove(temp_file)
-            
-            # إزالة حالة المستخدم
-            context.chat_data['user_states'][user_id] = None
-            
-            await update.message.reply_text(
-                f"✅ تم رفع ملف الكوكيز بنجاح!\n"
-                f"{validation_msg}\n\n"
-                f"🍪 الكوكيز مفعلة الآن تلقائياً"
-            )
-        else:
-            # تنظيف الملف المؤقت
-            os.remove(temp_file)
-            context.chat_data['user_states'][user_id] = None
-            
-            await update.message.reply_text(
-                f"❌ ملف الكوكيز غير صالح\n"
-                f"{validation_msg}\n\n"
-                f"⚠️ يرجى التأكد من صحة الملف والمحاولة مرة أخرى"
-            )
-            
-    except Exception as e:
-        logger.error(f"خطأ في معالجة ملف الكوكيز: {e}")
-        await update.message.reply_text("❌ حدث خطأ أثناء معالجة الملف")
-
-async def cookies_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """عرض حالة الكوكيز الحالية"""
-    user_id = update.effective_user.id
-    if user_id not in ADMIN_IDS:
-        await update.message.reply_text("🚫 هذه الميزة مخصصة للمسؤول فقط.")
-        return
-
-    config = load_cookies_config()
-    cookies_path = config.get("cookies_file", COOKIES_FILE)
-    
-    if os.path.exists(cookies_path):
-        file_size = os.path.getsize(cookies_path)
-        with open(cookies_path, 'r', encoding='utf-8') as f:
-            lines = f.readlines()
-        
-        message = (
-            f"📊 **حالة الكوكيز:**\n\n"
-            f"• الحالة: {'✅ مفعل' if config.get('enabled', False) else '❌ معطل'}\n"
-            f"• حجم الملف: {file_size} بايت\n"
-            f"• عدد السجلات: {len(lines)} سطر\n"
-            f"• المسار: {cookies_path}\n\n"
+def download_media(url: str, audio_only: bool, out_dir: str) -> tuple[str, dict]:
+    """تحميل الرابط داخل out_dir وإرجاع (مسار الملف، معلومات الفيديو)."""
+    opts = base_ydl_opts()
+    opts.update({
+        'outtmpl': os.path.join(out_dir, '%(title).60B [%(id)s].%(ext)s'),
+        'max_filesize': MAX_FILE_SIZE,
+    })
+    h = VIDEO_MAX_HEIGHT
+    if audio_only:
+        opts['format'] = 'ba[ext=m4a]/ba/b'
+        if FFMPEG_PATH:
+            opts['postprocessors'] = [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '192',
+            }]
+    elif FFMPEG_PATH:
+        opts['format'] = (
+            f'bv*[height<={h}][ext=mp4]+ba[ext=m4a]/'
+            f'bv*[height<={h}]+ba/'
+            f'b[height<={h}]/bv*+ba/b'
         )
-        
-        # عرض بعض الكوكيز كمثال (بدون قيم حساسة)
-        sample_cookies = []
-        for line in lines[:5]:  # أول 5 سطور فقط
-            parts = line.strip().split('\t')
-            if len(parts) >= 6:
-                sample_cookies.append(f"• {parts[5]}: {'*' * 10}")
-        
-        if sample_cookies:
-            message += "🔍 **عينة من الكوكيز:**\n" + "\n".join(sample_cookies)
-        
+        opts['merge_output_format'] = 'mp4'
     else:
-        message = "❌ لا يوجد ملف كوكيز حالياً"
-    
-    await update.message.reply_text(message)
+        # بدون ffmpeg لا يمكن الدمج، نختار صيغة جاهزة فيها صوت وصورة
+        opts['format'] = f'b[height<={h}][ext=mp4]/b[height<={h}]/b'
 
-# ================================
-# نظام التحميل مع الكوكيز
-# ================================
-
-def download_media(url: str, audio_only: bool = False) -> str:
-    """تحميل الميديا مع محاولات متعددة للصيغ في حالة الفشل"""
-    cookies_path = get_active_cookies_path()
-    
-    # قائمة بأساليب التحميل (صيغ مختلفة)
-    # سنحاول بـ 5 جودات شائعة تدريجياً لضمان النجاح
-    if audio_only:
-        formats_to_try = [
-            'bestaudio/best',
-            'bestaudio[ext=m4a]/best',
-            'best'
-        ]
-    else:
-        formats_to_try = [
-            # 1. محاولة الجودة المفضلة مع مرونة عالية (تفضل mp4 ولكن تقبل غيره)
-            'bestvideo[height<=?720]+bestaudio/best[height<=?720]/best',
-            # 2. جودة متوسطة لضمان العمل في الفتحات المحدودة
-            'bestvideo[height<=?480]+bestaudio/best[height<=?480]/best',
-            # 3. أي جودة متاحة بأي صيغة
-            'bestvideo+bestaudio/best',
-            # 4. التنسيق الأساسي (الأكثر استقراراً للفيديوهات المحمية)
-            'best'
-        ]
-
-    last_exception = None
-    for i, fmt in enumerate(formats_to_try):
-        logger.info(f"🔄 محاولة التحميل بالصيغة رقم {i+1}: {fmt}")
-        
-        ydl_opts = {
-            'outtmpl': os.path.join(DOWNLOAD_DIR, '%(title).70s.%(ext)s'),
-            'quiet': True,
-            'noplaylist': True,
-            'cookiefile': cookies_path,
-            'compat_opts': ['no-youtube-unavailable'],
-            'http_headers': {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            }
-        }
-            
-        if audio_only:
-            ydl_opts.update({
-                'format': fmt,
-                'postprocessors': [{
-                    'key': 'FFmpegExtractAudio',
-                    'preferredcodec': 'mp3',
-                    'preferredquality': '192',
-                }],
-            })
-        else:
-            ydl_opts.update({
-                'format': fmt,
-                'merge_output_format': 'mp4',
-            })
-            
-        if FFMPEG_PATH:
-            ydl_opts['ffmpeg_location'] = os.path.dirname(FFMPEG_PATH)
-
-        def check_duration(info, *, incomplete):
-            duration = info.get('duration')
-            if duration and duration > MAX_DURATION_SECONDS:
-                return "⏱️ الفيديو أطول من المسموح به."
-            return None
-
-        ydl_opts['match_filter'] = check_duration
-
+    cookies = get_active_cookies_path()
+    attempts = [cookies, None] if cookies else [None]
+    last_error = ''
+    for cookiefile in attempts:
+        run_opts = dict(opts)
+        if cookiefile:
+            run_opts['cookiefile'] = cookiefile
         try:
-            with YoutubeDL(ydl_opts) as ydl:
-                info_dict = ydl.extract_info(url, download=True)
-                filename = ydl.prepare_filename(info_dict)
-                
-                if audio_only:
-                    filename = os.path.splitext(filename)[0] + '.mp3'
-                
-                logger.info(f"✅ تم التحميل بالصيغة {i+1}: {filename}")
-                return filename
-                
-        except Exception as e:
-            error_str = str(e)
-            last_exception = e
-            logger.warning(f"⚠️ فشلت المحاولة {i+1} بالصيغة {fmt}: {error_str[:100]}...")
-            
-            # إذا كان الخطأ متعلق بالتنسيق فقط، استمر في الحلقة
-            if "format is not available" in error_str or "Requested format" in error_str:
-                continue
-            
-            # إذا كان الفيديو محمي بطلب تسجيل دخول، حاول بدون كوكيز (لو كانت مفعلة)
-            if "Sign in" in error_str and cookies_path:
-                logger.warning("🔄 تجربة التحميل بدون كوكيز...")
-                return download_media_without_cookies(url, audio_only)
-                
-            # أي خطأ آخر غير التنسيق، ارفع الاستثناء لو كانت هذه آخر محاولة
-            if i == len(formats_to_try) - 1:
+            with YoutubeDL(run_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+                if info.get('_type') == 'playlist' or 'entries' in info:
+                    raise DownloadFailed("Unsupported URL: playlists are not supported")
+                if (info.get('duration') or 0) > MAX_DURATION_SECONDS:
+                    raise DownloadFailed("video duration too long")
+                ydl.process_ie_result(info, download=True)
+            files = [os.path.join(out_dir, f) for f in os.listdir(out_dir)
+                     if not f.endswith(('.part', '.ytdl', '.tmp'))]
+            if not files:
+                raise DownloadFailed("File is larger than max-filesize")
+            return max(files, key=os.path.getsize), info
+        except (DownloadError, DownloadFailed) as e:
+            last_error = str(e)
+            logger.warning(f"⚠️ فشل التحميل ({'مع' if cookiefile else 'بدون'} كوكيز): {last_error[:200]}")
+            # لا فائدة من إعادة المحاولة إذا كانت المشكلة في الرابط نفسه
+            if any(k in last_error for k in ('Unsupported URL', 'duration too long', 'max-filesize')):
                 break
+            for f in os.listdir(out_dir):
+                os.remove(os.path.join(out_dir, f))
+    raise DownloadFailed(last_error)
 
-    # إذا انتهت الحلقة ولم ينجح التحميل
-    raise Exception(f"❌ تعذر تحميل الفيديو بأي صيغة متاحة: {str(last_exception)}")
-
-def download_media_without_cookies(url: str, audio_only: bool = False) -> str:
-    """تحميل الميديا بدون كوكيز مع محاولات متعددة للصيغ"""
-    logger.info("🌀 تجربة التحميل بدون كوكيز مع محاولات متعددة للصيغ")
-    
-    if audio_only:
-        formats_to_try = [
-            'bestaudio/best',
-            'bestaudio[ext=m4a]/best[ext=mp4]/best',
-            'best'
-        ]
-    else:
-        formats_to_try = [
-            'bestvideo[height<=?720][ext=mp4]+bestaudio[ext=m4a]/best[height<=?720][ext=mp4]/best',
-            'bestvideo[height<=?720]+bestaudio/best[height<=?720]/best',
-            'bestvideo[height<=?480]+bestaudio/best[height<=?480]/best',
-            'bestvideo+bestaudio/best',
-            'best'
-        ]
-
-    last_exception = None
-    for i, fmt in enumerate(formats_to_try):
-        logger.info(f"🌀 (بدون كوكيز) محاولة بالصيغة رقم {i+1}: {fmt}")
-        
-        ydl_opts = {
-            'outtmpl': os.path.join(DOWNLOAD_DIR, '%(title).70s.%(ext)s'),
-            'quiet': True,
-            'noplaylist': True,
-            'http_headers': {
-                'User-Agent': 'Mozilla/5.0 (Linux; Android 10; SM-G975F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36'
-            }
-        }
-            
-        if audio_only:
-            ydl_opts.update({
-                'format': fmt,
-                'postprocessors': [{
-                    'key': 'FFmpegExtractAudio',
-                    'preferredcodec': 'mp3',
-                    'preferredquality': '192',
-                }],
-            })
-        else:
-            ydl_opts.update({
-                'format': fmt,
-                'merge_output_format': 'mp4',
-            })
-            
-        if FFMPEG_PATH:
-            ydl_opts['ffmpeg_location'] = os.path.dirname(FFMPEG_PATH)
-
-        try:
-            with YoutubeDL(ydl_opts) as ydl:
-                info_dict = ydl.extract_info(url, download=True)
-                filename = ydl.prepare_filename(info_dict)
-                if audio_only:
-                    filename = os.path.splitext(filename)[0] + '.mp3'
-                
-                logger.info(f"✅ تم التحميل بنجاح بدون كوكيز بالصيغة {i+1}: {filename}")
-                return filename
-        except Exception as e:
-            error_str = str(e)
-            last_exception = e
-            logger.warning(f"🌀 محاولة {i+1} بدون كوكيز فشلت: {error_str[:100]}...")
-            if "format is not available" in error_str or "Requested format" in error_str:
-                continue
-            if i == len(formats_to_try) - 1:
-                break
-
-    raise Exception(f"❌ تعذر التحميل حتى بدون كوكيز: {str(last_exception)}")
 
 # ================================
-# باقي الدوال الأساسية
+# أدوات مساعدة
 # ================================
-
-user_links = {}
-
-def load_users():
-    if not os.path.exists(USERS_FILE):
-        with open(USERS_FILE, 'w', encoding='utf-8') as f:
-            json.dump({}, f)
-        return {}
-    try:
-        with open(USERS_FILE, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-            # تحديث الهيكل القديم لو وجد
-            updated = False
-            for uid in data:
-                if isinstance(data[uid], str):
-                    data[uid] = {
-                        "username": data[uid],
-                        "banned": False,
-                        "date_joined": "غير معروف"
-                    }
-                    updated = True
-            if updated:
-                save_users(data)
-            return data
-    except:
-        return {}
-
-def save_users(users):
-    with open(USERS_FILE, 'w', encoding='utf-8') as f:
-        json.dump(users, f, indent=2, ensure_ascii=False)
 
 async def is_user_subscribed(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
+    if not REQUIRED_CHANNEL or is_admin(user_id):
+        return True
     try:
         member = await context.bot.get_chat_member(REQUIRED_CHANNEL, user_id)
-        return member.status in ["member", "administrator", "creator"]
+        return member.status in ("member", "administrator", "creator", "owner")
     except Exception as e:
+        # البوت يجب أن يكون مشرفاً في القناة. لا نعطّل البوت للجميع بسبب خطأ هنا.
         logger.error(f"خطأ في التحقق من الاشتراك: {e}")
-        return True  # تجاهل الخطأ حتى لا يتعطل البوت للجميع
+        return True
+
+
+async def check_access(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """تسجيل المستخدم والتحقق من الحظر والاشتراك. ترجع False إذا مُنع."""
+    user = update.effective_user
+    await store.touch(user)
+    reply = update.effective_message.reply_text
+    if store.is_banned(user.id):
+        await reply("🚫 عذراً، لقد تم حظرك من استخدام هذا البوت.")
+        return False
+    if not await is_user_subscribed(context, user.id):
+        await reply(f"🔒 لا يمكنك استخدام البوت حتى تشترك في القناة أولاً:\n{REQUIRED_CHANNEL}")
+        return False
+    return True
+
+
+async def notify_admins(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    for admin_id in ADMIN_IDS:
+        try:
+            await context.bot.send_message(admin_id, text)
+        except Exception:
+            pass
+
+
+def extract_url(text: str) -> str | None:
+    match = URL_RE.search(text or '')
+    if not match:
+        return None
+    url = match.group(0)
+    host = re.sub(r'^https?://', '', url).split('/')[0].lower()
+    if any(host == d or host.endswith('.' + d) for d in SUPPORTED_SITES):
+        return url
+    return None
+
+
+# ================================
+# أوامر المستخدم
+# ================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not await is_user_subscribed(context, user_id):
-        await update.message.reply_text(
-            "🔒 لا يمكنك استخدام البوت حتى تشترك في القناة أولاً:\n"
-            f"{REQUIRED_CHANNEL}"
-        )
+    if not await check_access(update, context):
         return
-
     msg = (
         "👋 أهلاً بك في بوت التحميل!\n\n"
-        "أرسل رابط فيديو من YouTube أو TikTok أو Instagram وسأقوم بتحميله لك.\n"
+        "أرسل رابط فيديو من YouTube أو TikTok أو Instagram أو X أو Facebook وسأقوم بتحميله لك.\n"
         "اكتب /help لعرض التعليمات."
     )
-    
-    if user_id in ADMIN_IDS:
-        config = load_cookies_config()
-        cookies_status = "✅ مفعل" if config.get("enabled", False) else "❌ غير مفعل"
+    if is_admin(update.effective_user.id):
+        cookies_on = load_cookies_config().get("enabled", False)
         msg += (
-            f"\n\n🛠️ **معلومات المسؤول:**\n"
-            f"🍪 الكوكيز: {cookies_status}\n"
-            f"🔊 تحويل الصوت: {'✅ متاح' if FFMPEG_PATH else '❌ غير متاح'}\n"
-            f"اكتب /admin لفتح لوحة التحكم."
+            "\n\n🛠️ <b>معلومات المسؤول:</b>\n"
+            f"🍪 الكوكيز: {'✅ مفعل' if cookies_on else '❌ غير مفعل'}\n"
+            f"🔊 FFmpeg: {'✅ متاح' if FFMPEG_PATH else '❌ غير متاح'}\n"
+            f"🌐 بروكسي: {'✅' if PROXY else '❌'} | PO Token: {'✅' if POT_PROVIDER_URL else '❌'}\n"
+            "اكتب /admin لفتح لوحة التحكم."
         )
-    
-    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
+
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    help_text = (
-        "📌 *تعليمات استخدام البوت:*\n"
-        "1. أرسل رابط لفيديو من YouTube أو TikTok أو Instagram أو Twitter أو Facebook.\n"
-        "2. سيتم سؤالك إن كنت تريد تحميل الفيديو أو الصوت فقط.\n"
-        "3. اختر الخيار المناسب وانتظر حتى يكتمل التحميل.\n\n"
+    await update.message.reply_text(
+        "📌 <b>تعليمات استخدام البوت:</b>\n"
+        "1. أرسل رابط فيديو من YouTube أو TikTok أو Instagram أو X أو Facebook.\n"
+        "2. اختر تحميل الفيديو أو الصوت فقط.\n"
+        "3. انتظر حتى يكتمل التحميل.\n\n"
         "⚠️ البوت لا يدعم:\n"
-        "• روابط خاصة أو محمية بكلمة مرور\n"
-        "• الفيديوهات الأطول من ساعة ونصف\n"
-        "• الفيديوهات الأكبر من 50MB\n\n"
-        "💬 إن واجهت مشكلة، أعد المحاولة أو تحقق من صحة الرابط."
+        "• الروابط الخاصة أو المحمية\n"
+        f"• الفيديوهات الأطول من {MAX_DURATION_SECONDS // 60} دقيقة\n"
+        f"• الملفات الأكبر من {MAX_FILE_SIZE_MB}MB",
+        parse_mode=ParseMode.HTML,
     )
-    
-    await update.message.reply_text(help_text)
 
-async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """الواجهة الرئيسية للإدارة بلوحة مفاتيح واضحة"""
+
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.pop('state', None):
+        await update.message.reply_text("❌ تم الإلغاء.")
+    else:
+        await update.message.reply_text("لا توجد عملية لإلغائها.")
+
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if user_id not in ADMIN_IDS:
-        await update.message.reply_text("🚫 هذه الميزة مخصصة للمسؤول فقط.")
+    text = update.message.text or ''
+
+    if is_admin(user_id):
+        if context.user_data.get('state') == 'awaiting_broadcast':
+            context.user_data.pop('state', None)
+            context.application.create_task(run_broadcast(update, context), update=update)
+            return
+        if await handle_admin_keyboard(update, context, text):
+            return
+
+    if not await check_access(update, context):
         return
 
-    keyboard = [
-        ['📊 إحصائيات البوت', '👥 قائمة الأعضاء'],
-        ['🚫 المحظورين', '📢 إذاعة رسالة'],
-        ['🍪 الكوكيز', '🔙 خروج']
-    ]
-    
-    markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=False)
-    
+    url = extract_url(text)
+    if not url:
+        await update.message.reply_text(
+            "⚠️ أرسل رابطاً صحيحاً من المواقع المدعومة:\n"
+            "YouTube, TikTok, Instagram, X (Twitter), Facebook."
+        )
+        return
+
+    # نحفظ الرابط بمعرّف قصير حتى تعمل الأزرار حتى لو أرسل المستخدم عدة روابط
+    links: dict = context.user_data.setdefault('links', {})
+    if len(links) > 20:
+        links.pop(next(iter(links)))
+    key = uuid.uuid4().hex[:10]
+    links[key] = url
+
+    buttons = [[InlineKeyboardButton("🎞️ فيديو", callback_data=f"dl:v:{key}")]]
+    buttons[0].insert(0, InlineKeyboardButton("🎵 صوت فقط", callback_data=f"dl:a:{key}"))
     await update.message.reply_text(
-        "🛠 **لوحة تحكم المسؤول**\nتم تفعيل لوحة التحكم السريعة.",
-        reply_markup=markup,
-        parse_mode=ParseMode.MARKDOWN
+        "📥 هل تريد تحميل الصوت فقط أم الفيديو؟",
+        reply_markup=InlineKeyboardMarkup(buttons),
+        do_quote=True,
     )
 
-async def dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # إعادة توجيه للأمر الجديد
-    await admin_command(update, context)
+
+async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    _, kind, key = query.data.split(':', 2)
+
+    if store.is_banned(query.from_user.id):
+        await query.answer("🚫 أنت محظور.", show_alert=True)
+        return
+
+    url = context.user_data.get('links', {}).pop(key, None)
+    if not url:
+        await query.answer("❌ انتهت صلاحية الرابط، أرسله مرة أخرى.", show_alert=True)
+        return
+    await query.answer()
+
+    audio_only = kind == 'a'
+    if download_semaphore.locked():
+        await query.edit_message_text("⏳ في قائمة الانتظار، يوجد تحميلات أخرى جارية...")
+
+    out_dir = tempfile.mkdtemp(dir=DOWNLOAD_DIR)
+    try:
+        async with download_semaphore:
+            await query.edit_message_text("🔄 جارٍ التحميل، يرجى الانتظار...")
+            filepath, info = await asyncio.to_thread(download_media, url, audio_only, out_dir)
+
+        if os.path.getsize(filepath) > MAX_FILE_SIZE:
+            await query.edit_message_text(f"📦 حجم الملف أكبر من {MAX_FILE_SIZE_MB}MB ولا يمكن إرساله.")
+            return
+
+        await query.edit_message_text("📤 جارٍ الرفع إلى تيليجرام...")
+        title = (info.get('title') or 'media')[:64]
+        chat_id = query.message.chat_id
+        await context.bot.send_chat_action(
+            chat_id, ChatAction.UPLOAD_VOICE if audio_only else ChatAction.UPLOAD_VIDEO)
+
+        with open(filepath, 'rb') as f:
+            if audio_only:
+                await context.bot.send_audio(
+                    chat_id, audio=f, title=title,
+                    performer=info.get('uploader') or 'yazmeely',
+                    duration=int(info['duration']) if info.get('duration') else None,
+                    read_timeout=600, write_timeout=600,
+                )
+            else:
+                await context.bot.send_video(
+                    chat_id, video=f, supports_streaming=True,
+                    caption=f"🎬 {title}\nUploaded by yazmeely",
+                    width=info.get('width'), height=info.get('height'),
+                    duration=int(info['duration']) if info.get('duration') else None,
+                    read_timeout=600, write_timeout=600,
+                )
+        await query.delete_message()
+        logger.info(f"✅ تم إرسال الملف للمستخدم {query.from_user.id}")
+
+    except DownloadFailed as e:
+        err = str(e)
+        logger.error(f"فشل التحميل للمستخدم {query.from_user.id}: {err[:300]}")
+        await query.edit_message_text(friendly_error(err))
+        if 'Sign in to confirm' in err:
+            await notify_admins(
+                context,
+                "⚠️ يوتيوب يحظر السيرفر حالياً (Sign in to confirm you're not a bot).\n"
+                "الحلول: ارفع كوكيز جديدة عبر /cookies_upload، أو فعّل PROXY أو POT_PROVIDER_URL.",
+            )
+    except Exception as e:
+        logger.exception(f"خطأ غير متوقع للمستخدم {query.from_user.id}: {e}")
+        try:
+            await query.edit_message_text("❌ حدث خطأ أثناء إرسال الملف، حاول مرة أخرى.")
+        except BadRequest:
+            pass
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+# ================================
+# لوحة الإدارة
+# ================================
+
+ADMIN_KEYBOARD = ReplyKeyboardMarkup(
+    [
+        ['📊 إحصائيات البوت', '👥 قائمة الأعضاء'],
+        ['🚫 المحظورين', '📢 إذاعة رسالة'],
+        ['🍪 الكوكيز', '🔙 خروج'],
+    ],
+    resize_keyboard=True,
+)
+USERS_PER_PAGE = 10
+
+
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("🚫 هذه الميزة مخصصة للمسؤول فقط.")
+        return
+    await update.message.reply_text(
+        "🛠 <b>لوحة تحكم المسؤول</b>", reply_markup=ADMIN_KEYBOARD, parse_mode=ParseMode.HTML)
+
+
+def stats_text() -> str:
+    total = len(store.users)
+    banned = sum(1 for u in store.users.values() if u.get('banned'))
+    return (
+        "📊 <b>إحصائيات النظام:</b>\n\n"
+        f"👤 إجمالي المستخدمين: {total}\n"
+        f"✅ النشطين: {total - banned}\n"
+        f"🚫 المحظورين: {banned}\n"
+        f"🔊 FFmpeg: {'✅' if FFMPEG_PATH else '❌'}\n"
+        f"🍪 الكوكيز: {'✅' if get_active_cookies_path() else '❌'}\n"
+        f"🌐 بروكسي: {'✅' if PROXY else '❌'} | PO Token: {'✅' if POT_PROVIDER_URL else '❌'}"
+    )
+
+
+def users_page(page: int) -> tuple[str, InlineKeyboardMarkup]:
+    users = list(store.users.items())
+    pages = max(1, math.ceil(len(users) / USERS_PER_PAGE))
+    page = min(max(1, page), pages)
+    start_i = (page - 1) * USERS_PER_PAGE
+    buttons = []
+    for uid, u in users[start_i:start_i + USERS_PER_PAGE]:
+        status = "🚫" if u.get('banned') else "✅"
+        buttons.append([InlineKeyboardButton(
+            f"{status} {uid} ({u.get('username', 'N/A')})", callback_data=f"adm:user:{uid}")])
+    nav = []
+    if page > 1:
+        nav.append(InlineKeyboardButton("⬅️ السابق", callback_data=f"adm:users:{page - 1}"))
+    if page < pages:
+        nav.append(InlineKeyboardButton("التالي ➡️", callback_data=f"adm:users:{page + 1}"))
+    if nav:
+        buttons.append(nav)
+    text = f"👥 <b>الأعضاء ({len(users)}) — صفحة {page} من {pages}</b>\nاختر مستخدماً لإدارته:"
+    return text, InlineKeyboardMarkup(buttons)
+
+
+def user_view(uid: str) -> tuple[str, InlineKeyboardMarkup] | None:
+    u = store.users.get(uid)
+    if not u:
+        return None
+    banned = u.get('banned', False)
+    text = (
+        "👤 <b>إدارة المستخدم:</b>\n"
+        f"• ID: <code>{uid}</code>\n"
+        f"• الاسم: {html.escape(str(u.get('username')))}\n"
+        f"• تاريخ الانضمام: {u.get('date_joined') or 'غير معروف'}\n"
+        f"• الحالة: {'محظور 🚫' if banned else 'نشط ✅'}"
+    )
+    buttons = [
+        [InlineKeyboardButton("فك الحظر ✅" if banned else "حظر 🚫",
+                              callback_data=f"adm:{'unban' if banned else 'ban'}:{uid}")],
+        [InlineKeyboardButton("⬅️ عودة للقائمة", callback_data="adm:users:1")],
+    ]
+    return text, InlineKeyboardMarkup(buttons)
+
+
+def banned_view() -> tuple[str, InlineKeyboardMarkup | None]:
+    banned = [uid for uid, u in store.users.items() if u.get('banned')]
+    if not banned:
+        return "لا يوجد مستخدمين محظورين.", None
+    text = "🚫 <b>قائمة المحظورين:</b>\n\n" + "\n".join(f"• <code>{uid}</code>" for uid in banned[:50])
+    buttons = [[InlineKeyboardButton(f"فك حظر {uid}", callback_data=f"adm:unban:{uid}")] for uid in banned[:50]]
+    return text, InlineKeyboardMarkup(buttons)
+
+
+async def handle_admin_keyboard(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> bool:
+    reply = update.message.reply_text
+    if text == '📊 إحصائيات البوت':
+        await reply(stats_text(), parse_mode=ParseMode.HTML)
+    elif text == '👥 قائمة الأعضاء':
+        if not store.users:
+            await reply("لا يوجد أعضاء مسجلين حالياً.")
+        else:
+            msg, markup = users_page(1)
+            await reply(msg, reply_markup=markup, parse_mode=ParseMode.HTML)
+    elif text == '🚫 المحظورين':
+        msg, markup = banned_view()
+        await reply(msg, reply_markup=markup, parse_mode=ParseMode.HTML)
+    elif text == '📢 إذاعة رسالة':
+        context.user_data['state'] = 'awaiting_broadcast'
+        await reply("📢 أرسل الآن الرسالة المراد إذاعتها (نص أو صورة أو فيديو...)، أو /cancel للإلغاء.")
+    elif text == '🍪 الكوكيز':
+        await cookies_command(update, context)
+    elif text == '🔙 خروج':
+        await reply("🔙 تم إخفاء لوحة التحكم.", reply_markup=ReplyKeyboardRemove())
+    else:
+        return False
+    return True
+
 
 async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    user_id = query.from_user.id
-    
-    if user_id not in ADMIN_IDS:
+    if not is_admin(query.from_user.id):
         await query.answer("🚫 غير مصرح لك.", show_alert=True)
         return
 
-    data = query.data
-    
-    if data == 'admin_stats':
-        users = load_users()
-        total_users = len(users)
-        banned_users = sum(1 for u in users.values() if u.get('banned', False))
-        active_users = total_users - banned_users
-        
-        msg = (
-            f"📊 **إحصائيات النظام:**\n\n"
-            f"👤 إجمالي المستخدمين: {total_users}\n"
-            f"✅ المستخدمين النشطين: {active_users}\n"
-            f"🚫 المستخدمين المحظورين: {banned_users}\n"
-            f"🔊 FFmpeg: {'✅' if FFMPEG_PATH else '❌'}\n"
-        )
-        await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ عودة", callback_data='admin_back')]]), parse_mode=ParseMode.MARKDOWN)
-
-    elif data.startswith('admin_users_'):
-        page = int(data.split('_')[2])
-        users = load_users()
-        user_list = list(users.items())
-        per_page = 10 # زيادة العدد قليلاً
-        start = (page - 1) * per_page
-        end = start + per_page
-        
-        msg = f"👥 **قائمة المستخدمين (صفحة {page} من {math.ceil(len(user_list)/per_page)}):**\n\n"
-        buttons = []
-        
-        for uid, udata in user_list[start:end]:
-            status = "🚫" if udata.get('banned', False) else "✅"
-            msg += f"{status} `{uid}` - @{udata.get('username', 'N/A')}\n"
-            buttons.append([InlineKeyboardButton(f"إدارة {uid}", callback_data=f"manage_user_{uid}")])
-            
-        nav_buttons = []
-        if page > 1:
-            nav_buttons.append(InlineKeyboardButton("⬅️ السابق", callback_data=f"admin_users_{page-1}"))
-        if end < len(user_list):
-            nav_buttons.append(InlineKeyboardButton("التالي ➡️", callback_data=f"admin_users_{page+1}"))
-        
-        if nav_buttons:
-            buttons.append(nav_buttons)
-            
-        buttons.append([InlineKeyboardButton("⬅️ عودة لوحة التحكم", callback_data='admin_back')])
-        await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(buttons), parse_mode=ParseMode.MARKDOWN)
-
-    elif data.startswith('manage_user_'):
-        target_id = data.split('_')[2]
-        users = load_users()
-        udata = users.get(target_id)
-        if not udata:
-            await query.answer("❌ مستخدم غير موجود.")
+    _, action, arg = query.data.split(':', 2)
+    if action == 'users':
+        msg, markup = users_page(int(arg))
+    elif action in ('ban', 'unban'):
+        if not await store.set_banned(arg, action == 'ban'):
+            await query.answer("❌ مستخدم غير موجود.", show_alert=True)
             return
-            
-        is_banned = udata.get('banned', False)
-        status_text = "محظور 🚫" if is_banned else "نشط ✅"
-        ban_button_text = "فك الحظر ✅" if is_banned else "حظر 🚫"
-        ban_action = "unban" if is_banned else "ban"
-        
-        msg = (
-            f"👤 **إدارة المستخدم:**\n"
-            f"• ID: `{target_id}`\n"
-            f"• اليوزر: @{udata.get('username')}\n"
-            f"• الحالة: {status_text}\n"
-        )
-        
-        buttons = [
-            [InlineKeyboardButton(ban_button_text, callback_data=f"act_{ban_action}_{target_id}")],
-            [InlineKeyboardButton("⬅️ عودة للقائمة", callback_data='admin_users_1')]
-        ]
-        await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(buttons), parse_mode=ParseMode.MARKDOWN)
-
-    elif data.startswith('act_'):
-        parts = data.split('_')
-        action = parts[1]
-        target_id = parts[2]
-        users = load_users()
-        
-        if action == 'ban':
-            users[target_id]['banned'] = True
-            await query.answer(f"✅ تم حظر {target_id}", show_alert=True)
-        else:
-            users[target_id]['banned'] = False
-            await query.answer(f"✅ تم فك حظر {target_id}", show_alert=True)
-            
-        save_users(users)
-        # العودة لصفحة المستخدم
-        await admin_callback(update, context) # Re-trigger management view
-
-    elif data == 'admin_broadcast':
-        await query.edit_message_text("📢 **أرسل الآن الرسالة التي تريد إذاعتها لجميع المستخدمين.**\nأو اكتب /cancel للإلغاء.", parse_mode=ParseMode.MARKDOWN)
-        context.user_data['state'] = 'awaiting_broadcast'
-
-    elif data == 'admin_cookies':
-        # إعادة توجيه لوظائف الكوكيز الموجودة
-        await cookies_command(update, context)
-
-    elif data == 'admin_back':
-        await admin_command(update, context)
-        await query.delete_message()
-
-    elif data == 'admin_close':
-        await query.delete_message()
-
-    elif data == 'admin_banned':
-        users = load_users()
-        banned = [uid for uid, u in users.items() if u.get('banned', False)]
-        if not banned:
-            await query.answer("لا يوجد مستخدمين محظورين.", show_alert=True)
+        msg, markup = user_view(arg)
+    elif action == 'user':
+        view = user_view(arg)
+        if not view:
+            await query.answer("❌ مستخدم غير موجود.", show_alert=True)
             return
-            
-        msg = "🚫 **قائمة المحظورين:**\n\n"
-        buttons = []
-        for uid in banned:
-            msg += f"• `{uid}`\n"
-            buttons.append([InlineKeyboardButton(f"فك حظر {uid}", callback_data=f"act_unban_{uid}")])
-            
-        buttons.append([InlineKeyboardButton("⬅️ عودة", callback_data='admin_back')])
-        await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(buttons), parse_mode=ParseMode.MARKDOWN)
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = str(update.effective_user.id)
-    
-    if not await is_user_subscribed(context, int(user_id)):
-        await update.message.reply_text(
-            "🔒 لا يمكنك استخدام البوت حتى تشترك في القناة أولاً:\n"
-            f"{REQUIRED_CHANNEL}"
-        )
+        msg, markup = view
+    else:
+        await query.answer()
         return
 
-    users = load_users()
-    username = update.effective_user.username or "بدون اسم مستخدم"
-    
-    if user_id in users:
-        if users[user_id].get('banned', False):
-            await update.message.reply_text("🚫 عذراً، لقد تم حظرك من استخدام هذا البوت.")
-            return
-    
-    if user_id not in users:
-        users[user_id] = {
-            "username": username,
-            "banned": False,
-            "date_joined": str(asyncio.get_event_loop().time()) # تبسيط للتاريخ
-        }
-        save_users(users)
-        logger.info(f"✅ تم تسجيل مستخدم جديد: {user_id} - {username}")
-    else:
-        # تحديث الاسم لو تغير
-        if users[user_id].get('username') != username:
-            users[user_id]['username'] = username
-            save_users(users)
-        logger.info(f"📌 المستخدم موجود مسبقًا: {user_id} - {username}")
+    await query.answer({'ban': "✅ تم الحظر", 'unban': "✅ تم فك الحظر"}.get(action))
+    try:
+        await query.edit_message_text(msg, reply_markup=markup, parse_mode=ParseMode.HTML)
+    except BadRequest as e:
+        if 'not modified' not in str(e):
+            raise
 
-    # ميزة الإذاعة
-    if context.user_data.get('state') == 'awaiting_broadcast':
-        if update.message.text == '/cancel':
-            context.user_data['state'] = None
-            await update.message.reply_text("❌ تم إلغاء الإذاعة.")
-            return
-            
-        msg_to_send = update.message.text
-        context.user_data['state'] = None
-        await update.message.reply_text("⏳ جارٍ بدء الإذاعة...")
-        
-        success = 0
-        fail = 0
-        for uid in users:
+
+async def run_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    source = update.message
+    await source.reply_text(f"⏳ جارٍ الإذاعة إلى {len(store.users)} مستخدم...")
+    success = fail = 0
+    for uid in list(store.users):
+        try:
+            await context.bot.copy_message(int(uid), source.chat_id, source.message_id)
+            success += 1
+        except RetryAfter as e:
+            await asyncio.sleep(e.retry_after + 1)
             try:
-                await context.bot.send_message(chat_id=int(uid), text=f"📢 **رسالة من الإدارة:**\n\n{msg_to_send}", parse_mode=ParseMode.MARKDOWN)
+                await context.bot.copy_message(int(uid), source.chat_id, source.message_id)
                 success += 1
-            except:
+            except Exception:
                 fail += 1
-        
-        await update.message.reply_text(f"✅ اكتملت الإذاعة!\nتم الإرسال لـ: {success}\nفشل الإرسال لـ: {fail}")
+        except (Forbidden, BadRequest):
+            fail += 1
+        except Exception as e:
+            logger.warning(f"فشل الإرسال إلى {uid}: {e}")
+            fail += 1
+        await asyncio.sleep(0.05)  # حد تيليجرام ~30 رسالة/ثانية
+    await source.reply_text(f"✅ اكتملت الإذاعة!\nنجح: {success}\nفشل: {fail}")
+
+
+async def handle_admin_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """إذاعة الوسائط (صورة/فيديو...) عندما يكون المسؤول في وضع الإذاعة."""
+    if is_admin(update.effective_user.id) and context.user_data.get('state') == 'awaiting_broadcast':
+        context.user_data.pop('state', None)
+        context.application.create_task(run_broadcast(update, context), update=update)
+
+
+# ================================
+# إدارة الكوكيز
+# ================================
+
+def admin_only(func):
+    @functools.wraps(func)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not is_admin(update.effective_user.id):
+            await update.effective_message.reply_text("🚫 هذه الميزة مخصصة للمسؤول فقط.")
+            return
+        return await func(update, context)
+    return wrapper
+
+
+@admin_only
+async def cookies_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    enabled = load_cookies_config().get("enabled", False)
+    exists = os.path.exists(COOKIES_FILE)
+    await update.effective_message.reply_text(
+        "🍪 <b>إعدادات الكوكيز:</b>\n\n"
+        f"• الحالة: {'✅ مفعل' if enabled else '❌ غير مفعل'}\n"
+        f"• الملف: {'موجود' if exists else 'غير موجود'}\n\n"
+        "<b>الأوامر:</b>\n"
+        "/cookies_on - تفعيل الكوكيز\n"
+        "/cookies_off - إيقاف الكوكيز\n"
+        "/cookies_upload - رفع ملف كوكيز جديد\n"
+        "/cookies_status - فحص صلاحية الكوكيز الآن",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@admin_only
+async def cookies_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not os.path.exists(COOKIES_FILE):
+        await update.message.reply_text("❌ لا يوجد ملف كوكيز. ارفعه أولاً عبر /cookies_upload")
+        return
+    save_cookies_config({"enabled": True})
+    await update.message.reply_text("✅ تم تفعيل الكوكيز")
+
+
+@admin_only
+async def cookies_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    save_cookies_config({"enabled": False})
+    await update.message.reply_text("✅ تم إيقاف الكوكيز")
+
+
+@admin_only
+async def cookies_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['state'] = 'awaiting_cookies_file'
+    await update.message.reply_text(
+        "📤 <b>رفع ملف الكوكيز:</b>\n\n"
+        "1. افتح نافذة تصفح خفي (Incognito) وسجّل الدخول بحساب يوتيوب <b>ثانوي</b> (ليس حسابك الأساسي).\n"
+        "2. افتح youtube.com ثم صدّر الكوكيز بإضافة <i>Get cookies.txt LOCALLY</i>.\n"
+        "3. أغلق النافذة فوراً بدون تسجيل خروج (حتى لا تتغير الكوكيز).\n"
+        "4. أرسل ملف cookies.txt هنا.\n\n"
+        "⏳ بانتظار الملف... أو /cancel للإلغاء.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@admin_only
+async def cookies_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not os.path.exists(COOKIES_FILE):
+        await update.message.reply_text("❌ لا يوجد ملف كوكيز حالياً")
+        return
+    msg = await update.message.reply_text("🔍 جارٍ فحص الكوكيز...")
+    ok, result = await asyncio.to_thread(validate_cookies_file, COOKIES_FILE)
+    enabled = load_cookies_config().get("enabled", False)
+    await msg.edit_text(
+        f"📊 حالة الكوكيز:\n• التفعيل: {'✅' if enabled else '❌'}\n"
+        f"• الحجم: {os.path.getsize(COOKIES_FILE)} بايت\n• الفحص: {result}")
+
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    state = context.user_data.get('state')
+    if state == 'awaiting_broadcast':
+        await handle_admin_media(update, context)
+        return
+    if state != 'awaiting_cookies_file':
         return
 
-    # معالجة أزرار لوحة التحكم
-    if user_id in map(str, ADMIN_IDS):
-        text = update.message.text
-        if text == '📊 إحصائيات البوت':
-            users = load_users()
-            total_users = len(users)
-            banned_users = sum(1 for u in users.values() if u.get('banned', False))
-            msg = (
-                f"📊 **إحصائيات النظام:**\n\n"
-                f"👤 إجمالي المستخدمين: {total_users}\n"
-                f"✅ النشطين: {total_users - banned_users}\n"
-                f"🚫 المحظورين: {banned_users}\n"
-                f"🔊 FFmpeg: {'✅' if FFMPEG_PATH else '❌'}"
-            )
-            await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
-            return
-        elif text == '👥 قائمة الأعضاء':
-            # نستخدم نفس معالج الإنلاين لعرض القائمة بشكل منظم
-            users = load_users()
-            user_list = list(users.items())
-            if not user_list:
-                await update.message.reply_text("لا يوجد أعضاء مسجلين حالياً.")
-                return
-            
-            # بدلاً من عرض 5 فقط، نعيد التوجيه لمعالج الصفحات
-            # بما أن الضغطة أتت من زر كيبورد عادي، سنرسل رسالة جديدة تحتوي على الصفحة الأولى
-            msg = f"👥 **عرض جميع الأعضاء (إجمالي: {len(user_list)}):**\nالرجاء اختيار مستخدم لإدارته:"
-            buttons = []
-            per_page = 10
-            for uid, udata in user_list[:per_page]:
-                status = "🚫" if udata.get('banned', False) else "✅"
-                buttons.append([InlineKeyboardButton(f"{status} {uid} (@{udata.get('username', 'N/A')})", callback_data=f"manage_user_{uid}")])
-            
-            if len(user_list) > per_page:
-                buttons.append([InlineKeyboardButton("عرض الصفحة التالية ➡️", callback_data="admin_users_2")])
-            
-            await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(buttons), parse_mode=ParseMode.MARKDOWN)
-            return
-        elif text == '🚫 المحظورين':
-            users = load_users()
-            banned = [uid for uid, u in users.items() if u.get('banned', False)]
-            if not banned:
-                await update.message.reply_text("لا يوجد مستخدمين محظورين.")
-                return
-            msg = "🚫 **قائمة المحظورين:**\n\n"
-            buttons = []
-            for uid in banned:
-                msg += f"• `{uid}`\n"
-                buttons.append([InlineKeyboardButton(f"فك حظر {uid}", callback_data=f"act_unban_{uid}")])
-            await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(buttons), parse_mode=ParseMode.MARKDOWN)
-            return
-        elif text == '📢 إذاعة رسالة':
-            await update.message.reply_text("📢 أرسل الآن الرسالة المراد إذاعتها، أو اكتب /cancel للإلغاء.")
-            context.user_data['state'] = 'awaiting_broadcast'
-            return
-        elif text == '🍪 الكوكيز':
-            await cookies_command(update, context)
-            return
-        elif text == '🔙 خروج':
-            await update.message.reply_text("🔙 تم الخروج من وضع الإدارة وإزالة لوحة التحكم.", reply_markup=ReplyKeyboardRemove())
-            return
+    document = update.message.document
+    if not (document.file_name or '').endswith('.txt') and document.mime_type != 'text/plain':
+        await update.message.reply_text("❌ يرجى رفع ملف نصي (txt) فقط")
+        return
+    if document.file_size and document.file_size > 1024 * 1024:
+        await update.message.reply_text("❌ الملف كبير جداً")
+        return
 
-    url = update.message.text.strip()
-    
-    if 'youtu.be' in url or 'youtube.com' in url:
-        if '?' in url:
-            url = url.split('?')[0]
-        if '&' in url:
-            url = url.split('&')[0]
-    
-    if any(domain in url for domain in SUPPORTED_SITES):
-        user_links[user_id] = url
-        
-        if FFMPEG_PATH:
-            buttons = [
-                [InlineKeyboardButton("🎵 صوت فقط", callback_data='audio'),
-                 InlineKeyboardButton("🎞️ فيديو", callback_data='video')]
-            ]
-            message_text = "📥 هل تريد تحميل الصوت فقط أم الفيديو؟"
+    context.user_data.pop('state', None)
+    temp_file = os.path.join(DATA_DIR, f"cookies_upload_{update.effective_user.id}.txt")
+    msg = await update.message.reply_text("🔍 جارٍ فحص الملف...")
+    try:
+        file = await context.bot.get_file(document.file_id)
+        await file.download_to_drive(temp_file)
+        ok, result = await asyncio.to_thread(validate_cookies_file, temp_file)
+        if ok:
+            os.replace(temp_file, COOKIES_FILE)
+            os.chmod(COOKIES_FILE, 0o600)
+            save_cookies_config({"enabled": True})
+            await msg.edit_text(f"✅ تم حفظ الكوكيز وتفعيلها.\n{result}")
         else:
-            buttons = [
-                [InlineKeyboardButton("🎞️ فيديو", callback_data='video')]
-            ]
-            message_text = "📥 تحميل الفيديو (تحويل الصوت غير متاح حالياً)"
-            
-        await update.message.reply_text(
-            message_text, 
-            reply_markup=InlineKeyboardMarkup(buttons)
-        )
-    else:
-        await update.message.reply_text(
-            "⚠️ أرسل رابط صحيح من المواقع المدعومة فقط:\n"
-            "YouTube, TikTok, Instagram, Twitter, Facebook."
-        )
-
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    
-    # التحقق من نوع الكالباك (إدارة أم تحميل)
-    if query.data.startswith('admin_') or query.data.startswith('manage_user_') or query.data.startswith('act_'):
-        await admin_callback(update, context)
-        return
-
-    await query.answer()
-    
-    user_id = str(query.from_user.id)
-    url = user_links.get(user_id)
-    
-    if not url:
-        await query.edit_message_text("❌ لم يتم العثور على الرابط، أرسل الرابط مرة أخرى.")
-        return
-
-    await query.edit_message_text("🔄 جارٍ التحميل، يرجى الانتظار...")
-    
-    try:
-        audio_only = query.data == 'audio'
-        filepath = None
-        
-        if audio_only and not FFMPEG_PATH:
-            await query.message.reply_text("❌ تحويل الصوت غير متاح حالياً. يرجى تثبيت ffmpeg.")
-            return
-        
-        filepath = await asyncio.to_thread(download_media, url, audio_only)
-        
-        if not os.path.exists(filepath):
-            raise FileNotFoundError(f"الملف {filepath} غير موجود")
-        
-        file_size = os.path.getsize(filepath)
-        if file_size > MAX_FILE_SIZE:
-            await query.message.reply_text("❌ حجم الملف كبير جداً ولا يمكن إرساله عبر التيليجرام.")
-            return
-        
-        with open(filepath, 'rb') as f:
-            if audio_only:
-                await query.message.reply_audio(
-                    audio=f,
-                    title=os.path.basename(filepath).replace('.mp3', '')[:64],
-                    performer="IXL Download",
-                    read_timeout=350,
-                    write_timeout=350
-                )
-            else:
-                await query.message.reply_video(
-                    video=f,
-                    supports_streaming=True,
-                    read_timeout=350,
-                    write_timeout=350,
-                    caption="Uploaded by yazmeely "
-                )
-        
-        logger.info(f"✅ تم إرسال الملف بنجاح للمستخدم {user_id}")
-        
+            await msg.edit_text(f"❌ ملف الكوكيز غير صالح:\n{result}")
     except Exception as e:
-        error_msg = f"❌ حدث خطأ أثناء التحميل:\n{str(e)}"
-        logger.error(f"خطأ للمستخدم {user_id}: {e}")
-        await query.message.reply_text(error_msg)
+        logger.exception(f"خطأ في معالجة ملف الكوكيز: {e}")
+        await msg.edit_text("❌ حدث خطأ أثناء معالجة الملف")
     finally:
-        if filepath and os.path.exists(filepath):
-            try:
-                os.remove(filepath)
-            except Exception as e:
-                logger.error(f"خطأ في حذف الملف: {e}")
+        if os.path.exists(temp_file):
+            os.remove(temp_file)
 
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.error(f"حدث خطأ: {context.error}")
-    if update and update.effective_message:
-        await update.effective_message.reply_text("❌ حدث خطأ غير متوقع. يرجى المحاولة مرة أخرى.")
 
-# تشغيل البوت
+# ================================
+# التشغيل
+# ================================
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.error("حدث خطأ:", exc_info=context.error)
+    if isinstance(update, Update) and update.effective_message:
+        try:
+            await update.effective_message.reply_text("❌ حدث خطأ غير متوقع. يرجى المحاولة مرة أخرى.")
+        except Exception:
+            pass
+
+
 def main():
-    try:
-        # إعداد المجلدات
-        os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-        
-        # تحميل إعدادات الكوكيز
-        config = load_cookies_config()
-        logger.info(f"🍪 إعدادات الكوكيز: {'مفعل' if config.get('enabled', False) else 'معطل'}")
-        
-        # استيراد math للصفحات
-        import math
-        
-        # بناء التطبيق مع دعم التعددية (Concurrent Updates)
-        app = ApplicationBuilder().token(BOT_TOKEN).concurrent_updates(True).build()
+    if not BOT_TOKEN:
+        raise SystemExit("❌ متغير البيئة BOT_TOKEN غير موجود. راجع ملف .env.example")
+    if not ADMIN_IDS:
+        logger.warning("⚠️ ADMIN_IDS فارغ — لن يتمكن أحد من استخدام لوحة الإدارة")
 
-        # إضافة المعالجات
-        app.add_handler(CommandHandler("start", start))
-        app.add_handler(CommandHandler("help", help_command))
-        app.add_handler(CommandHandler("dashboard", dashboard))
-        app.add_handler(CommandHandler("admin", admin_command))
-        app.add_handler(CommandHandler("cookies", cookies_command))
-        app.add_handler(CommandHandler("cookies_on", cookies_on))
-        app.add_handler(CommandHandler("cookies_off", cookies_off))
-        app.add_handler(CommandHandler("cookies_upload", cookies_upload))
-        app.add_handler(CommandHandler("cookies_status", cookies_status))
-        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-        app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-        app.add_handler(CallbackQueryHandler(button_callback))
-        
-        app.add_error_handler(error_handler)
+    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    # حذف بقايا تحميلات سابقة لم تكتمل
+    for name in os.listdir(DOWNLOAD_DIR):
+        shutil.rmtree(os.path.join(DOWNLOAD_DIR, name), ignore_errors=True)
+    store.load()
 
-        print("=" * 50)
-        print("✅ البوت يعمل الآن...")
-        print(f"🔊 FFmpeg: {'✅ متوفر' if FFMPEG_PATH else '❌ غير متوفر'}")
-        config = load_cookies_config()
-        print(f"🍪 الكوكيز: {'✅ مفعل' if config.get('enabled', False) else '❌ معطل'}")
-        print("=" * 50)
-        
-        app.run_polling(drop_pending_updates=True)
-        
-    except Exception as e:
-        logger.error(f"خطأ في تشغيل البوت: {e}")
+    if WEB_SERVER:
+        Thread(target=run_flask, daemon=True).start()
+
+    builder = ApplicationBuilder().token(BOT_TOKEN).concurrent_updates(True)
+    if TELEGRAM_API_URL:
+        builder = builder.base_url(f"{TELEGRAM_API_URL}/bot").base_file_url(f"{TELEGRAM_API_URL}/file/bot")
+    app = builder.build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("cancel", cancel_command))
+    app.add_handler(CommandHandler(["admin", "dashboard"], admin_command))
+    app.add_handler(CommandHandler("cookies", cookies_command))
+    app.add_handler(CommandHandler("cookies_on", cookies_on))
+    app.add_handler(CommandHandler("cookies_off", cookies_off))
+    app.add_handler(CommandHandler("cookies_upload", cookies_upload))
+    app.add_handler(CommandHandler("cookies_status", cookies_status))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    app.add_handler(MessageHandler(
+        (filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.VOICE | filters.ANIMATION) & ~filters.COMMAND,
+        handle_admin_media))
+    app.add_handler(CallbackQueryHandler(download_callback, pattern=r'^dl:'))
+    app.add_handler(CallbackQueryHandler(admin_callback, pattern=r'^adm:'))
+    app.add_error_handler(error_handler)
+
+    logger.info("=" * 50)
+    logger.info("✅ البوت يعمل الآن...")
+    logger.info(f"🔊 FFmpeg: {'✅' if FFMPEG_PATH else '❌'}")
+    logger.info(f"🍪 الكوكيز: {'✅' if get_active_cookies_path() else '❌'}")
+    logger.info(f"🌐 بروكسي: {'✅' if PROXY else '❌'} | PO Token: {'✅' if POT_PROVIDER_URL else '❌'}")
+    if not shutil.which('deno') and not shutil.which('node'):
+        logger.warning("⚠️ لم يتم العثور على deno/node — يوتيوب يحتاج JS runtime لفك التشفير. راجع README")
+    logger.info("=" * 50)
+
+    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+
 
 if __name__ == '__main__':
     main()

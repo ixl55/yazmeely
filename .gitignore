@@ -1,0 +1,10 @@
+.env
+data/
+downloads/
+cookies*.txt
+cookies_config.json
+users.json
+__pycache__/
+*.pyc
+.venv/
+venv/

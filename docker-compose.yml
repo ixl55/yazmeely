@@ -1,0 +1,17 @@
+services:
+  bot:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      POT_PROVIDER_URL: http://bgutil-provider:4416
+    volumes:
+      - ./data:/app/data
+    depends_on:
+      - bgutil-provider
+
+  # يولّد PO Tokens تجعل طلبات يوتيوب تبدو كمتصفح حقيقي
+  bgutil-provider:
+    image: brainicism/bgutil-ytdlp-pot-provider
+    restart: unless-stopped
+    init: true
